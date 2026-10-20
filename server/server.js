@@ -17,6 +17,9 @@ fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
 const app = express();
 const port = Number(process.env.PORT || 3002);
+const isProduction = process.env.NODE_ENV === 'production';
+const cookieSecure = process.env.SESSION_COOKIE_SECURE !== 'false' && isProduction;
+const cookieSameSite = process.env.SESSION_COOKIE_SAME_SITE || 'lax';
 const db = new DatabaseSync(dbPath);
 const SESSION_COOKIE = 'accesshub_session';
 const VALID_ROLES = ['admin', 'manager', 'user'];
@@ -325,8 +328,8 @@ app.post('/api/auth/register', (req, res) => {
   const session = createSessionRecord(userId);
   res.cookie(SESSION_COOKIE, session.token, {
     httpOnly: true,
-    sameSite: 'lax',
-    secure: false,
+    sameSite: cookieSameSite,
+    secure: cookieSecure,
     maxAge: 1000 * 60 * 60 * 12,
   });
 
@@ -362,8 +365,8 @@ app.post('/api/auth/login', (req, res) => {
   const session = createSessionRecord(user.id);
   res.cookie(SESSION_COOKIE, session.token, {
     httpOnly: true,
-    sameSite: 'lax',
-    secure: false,
+    sameSite: cookieSameSite,
+    secure: cookieSecure,
     maxAge: 1000 * 60 * 60 * 12,
   });
 

@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: accesshub
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: ACCESSHUB_DB_PATH
+        value: /var/data/accesshub.db
+      - key: SESSION_COOKIE_SECURE
+        value: true
+      - key: SESSION_COOKIE_SAME_SITE
+        value: lax
+      - key: ACCESSHUB_ADMIN_PASSWORD
+        generateValue: true
+      - key: ACCESSHUB_MANAGER_PASSWORD
+        generateValue: true
+      - key: ACCESSHUB_USER_PASSWORD
+        generateValue: true
+    disk:
+      name: accesshub-data
+      mountPath: /var/data
+      sizeGB: 1

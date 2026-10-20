@@ -56,7 +56,29 @@ npm.cmd run build
 npm.cmd start
 ```
 
-The Express server also serves the built frontend from the `dist` folder when present.
+Set the environment variables below before production startup. The Express app serves the built frontend from `dist` when present.
+
+```powershell
+$env:NODE_ENV = 'production'
+$env:PORT = '3002'
+$env:ACCESSHUB_DB_PATH = 'C:\Users\NJ\Documents\SKYLEAX_TASK_08\server\data\accesshub.db'
+$env:ACCESSHUB_ADMIN_PASSWORD = '<strong-admin-password>'
+$env:ACCESSHUB_MANAGER_PASSWORD = '<strong-manager-password>'
+$env:ACCESSHUB_USER_PASSWORD = '<strong-user-password>'
+$env:SESSION_COOKIE_SECURE = 'true'
+$env:SESSION_COOKIE_SAME_SITE = 'lax'
+```
+
+### Deployment (Render)
+
+This project is structured as a single Node.js service that serves the built React frontend and the Express API from the same app. A Render Web Service suits it well:
+
+- Build command: `npm install && npm run build`
+- Start command: `npm start`
+- Persistent SQLite path: `/var/data/accesshub.db`
+- Required environment variables: `NODE_ENV`, `PORT`, `ACCESSHUB_DB_PATH`, `ACCESSHUB_ADMIN_PASSWORD`, `ACCESSHUB_MANAGER_PASSWORD`, `ACCESSHUB_USER_PASSWORD`, `SESSION_COOKIE_SECURE`, `SESSION_COOKIE_SAME_SITE`
+
+The repository includes a ready-to-use [render.yaml](./render.yaml) for that setup.
 
 ## Authentication and authorization
 
