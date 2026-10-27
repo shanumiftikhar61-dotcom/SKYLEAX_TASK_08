@@ -3,24 +3,27 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "concurrently \"npm run server\" \"npm run client\"",
     "server": "node server/server.js",
-    "client": "vite --host 0.0.0.0",
+    "client": "vite",
     "build": "vite build",
     "start": "node server/server.js",
     "test": "node --test"
   },
   "dependencies": {
-    "cors": "^2.8.6",
+    "dotenv": "^18.0.9",
     "express": "^4.22.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^4.7.0",
+    "@vitejs/plugin-react": "^5.2.0",
     "concurrently": "^9.2.5",
     "supertest": "^7.3.1",
-    "vite": "^5.4.21"
+    "vite": "^7.3.7"
   }
 }

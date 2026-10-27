@@ -16,6 +16,16 @@ const emptyAuthForm = {
   team: 'General',
 };
 
+const emptyAdminForm = {
+  fullName: '',
+  email: '',
+  password: '',
+  team: 'General',
+  role: 'user',
+};
+
+const roleLabel = (role) => role === 'user' ? 'Member' : role[0].toUpperCase() + role.slice(1);
+
 const statusColors = {
   pending: 'status-pending',
   approved: 'status-approved',
@@ -43,7 +53,12 @@ async function fetchJson(path, options = {}) {
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || !payload.success) {
-    throw new Error(payload?.error?.message || 'Request failed');
+    const message = payload?.error?.details?.length
+      ? `${payload.error.message}: ${payload.error.details.join(' ')}`
+      : payload?.error?.message || 'Request failed';
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
 
   return payload.data;
@@ -51,6 +66,7 @@ async function fetchJson(path, options = {}) {
 
 export default function App() {
   const [session, setSession] = useState(null);
+  const [checkingSession, setCheckingSession] = useState(true);
   const [activeView, setActiveView] = useState('dashboard');
   const [authMode, setAuthMode] = useState('login');
   const [authForm, setAuthForm] = useState(emptyAuthForm);
@@ -63,15 +79,23 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [search, setSearch] = useState('');
   const [error, setError] = useState('');
+  const [profileForm, setProfileForm] = useState({ fullName: '', email: '' });
+  const [adminForm, setAdminForm] = useState(emptyAdminForm);
+  const [notice, setNotice] = useState('');
 
   const loadSession = async () => {
     try {
       const sessionData = await fetchJson('/api/auth/session');
       setSession(sessionData.user);
+      setProfileForm({ fullName: sessionData.user.fullName, email: sessionData.user.email });
+      setAccessForm({ ...emptyAccessForm, employee: sessionData.user.fullName, team: sessionData.user.team });
       return sessionData.user;
-    } catch {
-      setSession(null);
+    } catch (err) {
+      if (err.status === 401) setSession(null);
+      else setError(err.message);
       return null;
+    } finally {
+      setCheckingSession(false);
     }
   };
 
@@ -80,11 +104,11 @@ export default function App() {
 
     try {
       const [requestData, statsData, userData, teamData] = await Promise.all([
-        fetchJson('/api/requests').catch(() => []),
-        fetchJson('/api/stats').catch(() => ({ total: 0, pending: 0, approved: 0, rejected: 0, revoked: 0 })),
-        currentUser.role === 'admin' ? fetchJson('/api/users').catch(() => []) : Promise.resolve([]),
+        fetchJson('/api/requests'),
+        fetchJson('/api/stats'),
+        currentUser.role === 'admin' ? fetchJson('/api/users') : Promise.resolve([]),
         currentUser.role === 'manager' || currentUser.role === 'admin'
-          ? fetchJson('/api/team/summary').catch(() => null)
+          ? fetchJson('/api/team/summary')
           : Promise.resolve(null),
       ]);
 
@@ -94,12 +118,13 @@ export default function App() {
       setTeamSummary(teamData);
       setError('');
     } catch (err) {
+      if (err.status === 401) setSession(null);
       setError(err.message);
     }
   };
 
   useEffect(() => {
-    loadSession().then((user) => user && loadProtectedData(user));
+    loadSession();
   }, []);
 
   useEffect(() => {
@@ -107,6 +132,29 @@ export default function App() {
       loadProtectedData(session);
     }
   }, [session]);
+
+  useEffect(() => {
+    const resolveView = () => {
+      const requestedView = window.location.hash.slice(1) || 'dashboard';
+      if (requestedView === 'dashboard' || requestedView === 'profile') {
+        setActiveView(requestedView);
+      } else if (requestedView === 'users' && session?.role === 'admin') {
+        setActiveView('users');
+      } else {
+        setActiveView('access-denied');
+      }
+    };
+
+    resolveView();
+    window.addEventListener('hashchange', resolveView);
+    return () => window.removeEventListener('hashchange', resolveView);
+  }, [session]);
+
+  const navigateTo = (view) => {
+    setActiveView(view);
+    const nextHash = view === 'dashboard' ? '' : `#${view}`;
+    if (window.location.hash !== nextHash) window.location.hash = nextHash;
+  };
 
   const visibleRequests = useMemo(() => {
     return requests.filter((request) => {
@@ -125,6 +173,8 @@ export default function App() {
   const handleAuthSubmit = async (event) => {
     event.preventDefault();
     setAuthError('');
+    setError('');
+    setNotice('');
 
     try {
       const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
@@ -143,7 +193,10 @@ export default function App() {
       });
 
       setSession(data.user);
+      setProfileForm({ fullName: data.user.fullName, email: data.user.email });
+      setAccessForm({ ...emptyAccessForm, employee: data.user.fullName, team: data.user.team });
       setAuthForm(emptyAuthForm);
+      setError('');
     } catch (err) {
       setAuthError(err.message);
     }
@@ -152,16 +205,54 @@ export default function App() {
   const handleLogout = async () => {
     try {
       await fetchJson('/api/auth/logout', { method: 'POST' });
-    } catch {
-      // no-op; still clear local UI state
+    } catch (err) {
+      if (err.status !== 401) {
+        setError(`Unable to log out: ${err.message}`);
+        return;
+      }
     }
 
     setSession(null);
+    setNotice('You have been signed out.');
     setRequests([]);
     setStats({ total: 0, pending: 0, approved: 0, rejected: 0, revoked: 0 });
     setUsers([]);
     setTeamSummary(null);
-    setActiveView('dashboard');
+    navigateTo('dashboard');
+  };
+
+  const updateProfile = async (event) => {
+    event.preventDefault();
+    setError('');
+    setNotice('');
+    try {
+      const updated = await fetchJson(`/api/users/${session.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(profileForm),
+      });
+      setSession(updated);
+      setProfileForm({ fullName: updated.fullName, email: updated.email });
+      setNotice('Your profile has been updated.');
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const provisionUser = async (event) => {
+    event.preventDefault();
+    setError('');
+    setNotice('');
+    try {
+      const created = await fetchJson('/api/users', {
+        method: 'POST',
+        body: JSON.stringify(adminForm),
+      });
+      setAdminForm(emptyAdminForm);
+      setNotice(`${created.fullName} was added as a ${roleLabel(created.role)}.`);
+      await loadProtectedData(session);
+    } catch (err) {
+      setError(err.message);
+    }
   };
 
   const handleAccessChange = (event) => {
@@ -172,26 +263,31 @@ export default function App() {
   const handleAccessSubmit = async (event) => {
     event.preventDefault();
     setError('');
+    setNotice('');
 
     try {
       await fetchJson('/api/requests', {
         method: 'POST',
-        body: JSON.stringify(accessForm),
+        body: JSON.stringify({
+          ...accessForm,
+          team: session.role === 'admin' ? accessForm.team : session.team,
+        }),
       });
-      setAccessForm(emptyAccessForm);
+      setAccessForm({ ...emptyAccessForm, employee: session.fullName, team: session.team });
       await loadProtectedData(session);
+      setNotice('Your access request has been submitted for review.');
     } catch (err) {
       setError(err.message);
     }
   };
 
-  const updateRequestStatus = async (id, status, reviewer = session?.fullName || 'AccessHub') => {
+  const updateRequestStatus = async (id, status) => {
     setError('');
 
     try {
       await fetchJson(`/api/requests/${id}`, {
         method: 'PATCH',
-        body: JSON.stringify({ status, reviewer }),
+        body: JSON.stringify({ status }),
       });
       await loadProtectedData(session);
     } catch (err) {
@@ -210,13 +306,17 @@ export default function App() {
     }
   };
 
+  if (checkingSession) {
+    return <main className="loading-state" aria-live="polite">Checking your secure session…</main>;
+  }
+
   if (!session) {
     return (
       <div className="auth-shell">
         <div className="auth-card">
           <div className="auth-header">
             <p className="eyebrow">Access operations</p>
-            <h1>AccessHub</h1>
+            <h1>AccessHub <span>Team Access Portal</span></h1>
           </div>
 
           <div className="auth-toggle">
@@ -270,7 +370,11 @@ export default function App() {
                 name="password"
                 value={authForm.password}
                 onChange={handleAuthFieldChange}
-                placeholder="Enter password"
+                placeholder={authMode === 'register' ? '10+ characters with upper, lower & number' : 'Enter password'}
+                minLength={authMode === 'register' ? 10 : undefined}
+                maxLength={authMode === 'register' ? 128 : undefined}
+                pattern={authMode === 'register' ? '(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9]).{10,128}' : undefined}
+                autoComplete={authMode === 'register' ? 'new-password' : 'current-password'}
                 required
               />
             </label>
@@ -295,9 +399,10 @@ export default function App() {
             </button>
           </form>
 
+          {error ? <p className="form-error" role="alert">{error}</p> : null}
           <div className="demo-box">
             <strong>Getting started</strong>
-            <p>Register to create a User account. Configure seed passwords before first launch to create admin or manager accounts.</p>
+            <p>Create a Member account or sign in with credentials provisioned by your administrator. Accounts and roles are stored securely on the server.</p>
           </div>
         </div>
       </div>
@@ -309,24 +414,27 @@ export default function App() {
       <header className="topbar">
         <div>
           <p className="eyebrow">Access operations</p>
-          <h1>AccessHub</h1>
+          <h1>AccessHub <span>Team Access Portal</span></h1>
         </div>
 
         <div className="topbar-actions">
           <div className="user-pill">
-            {session.fullName} · {session.role}
+            {session.fullName} · {roleLabel(session.role)}
           </div>
           <button type="button" className="secondary-button" onClick={handleLogout}>Logout</button>
         </div>
       </header>
 
       <nav className="nav-tabs">
-        <button type="button" className={activeView === 'dashboard' ? 'active' : ''} onClick={() => setActiveView('dashboard')}>Dashboard</button>
-        <button type="button" className={activeView === 'profile' ? 'active' : ''} onClick={() => setActiveView('profile')}>Profile</button>
+        <button type="button" aria-current={activeView === 'dashboard' ? 'page' : undefined} className={activeView === 'dashboard' ? 'active' : ''} onClick={() => navigateTo('dashboard')}>Dashboard</button>
+        <button type="button" aria-current={activeView === 'profile' ? 'page' : undefined} className={activeView === 'profile' ? 'active' : ''} onClick={() => navigateTo('profile')}>Profile</button>
         {session.role === 'admin' ? (
-          <button type="button" className={activeView === 'users' ? 'active' : ''} onClick={() => setActiveView('users')}>User management</button>
+          <button type="button" aria-current={activeView === 'users' ? 'page' : undefined} className={activeView === 'users' ? 'active' : ''} onClick={() => navigateTo('users')}>User management</button>
         ) : null}
       </nav>
+
+      {error ? <p className="form-error global-error" role="alert">{error}</p> : null}
+      {notice ? <p className="success-message" role="status">{notice}</p> : null}
 
       <section className="metrics-grid">
         {[
@@ -357,7 +465,14 @@ export default function App() {
               </label>
               <label>
                 Team
-                <input name="team" value={accessForm.team} onChange={handleAccessChange} placeholder="Finance" required />
+                <input
+                  name="team"
+                  value={session.role === 'admin' ? accessForm.team : session.team}
+                  onChange={session.role === 'admin' ? handleAccessChange : undefined}
+                  placeholder="Finance"
+                  readOnly={session.role !== 'admin'}
+                  required
+                />
               </label>
               <label>
                 Role
@@ -398,15 +513,13 @@ export default function App() {
                 />
               </label>
 
-              {error ? <p className="form-error">{error}</p> : null}
-
               <button type="submit" className="primary-button">Submit request</button>
             </form>
           </section>
 
           <section className="panel list-panel">
             <div className="panel-header">
-              <h2>Access queue</h2>
+              <h2>{session.role === 'user' ? 'My requests' : session.role === 'manager' ? 'Team access queue' : 'Access queue'}</h2>
               <span>{visibleRequests.length} items</span>
             </div>
 
@@ -459,18 +572,16 @@ export default function App() {
                     <p className="justification">{request.justification}</p>
 
                     <div className="card-actions">
-                      <button type="button" className="action approve" onClick={() => updateRequestStatus(request.id, 'approved')}>
-                        Approve
-                      </button>
-                      <button type="button" className="action reject" onClick={() => updateRequestStatus(request.id, 'rejected')}>
-                        Reject
-                      </button>
-                      <button type="button" className="action pending" onClick={() => updateRequestStatus(request.id, 'pending')}>
-                        Pending
-                      </button>
-                      <button type="button" className="action delete" onClick={() => deleteRequest(request.id)}>
-                        Delete
-                      </button>
+                      {session.role !== 'user' ? (
+                        <>
+                          <button type="button" className="action approve" onClick={() => updateRequestStatus(request.id, 'approved')}>Approve</button>
+                          <button type="button" className="action reject" onClick={() => updateRequestStatus(request.id, 'rejected')}>Reject</button>
+                          <button type="button" className="action pending" onClick={() => updateRequestStatus(request.id, 'pending')}>Reopen</button>
+                          <button type="button" className="action delete" onClick={() => {
+                            if (window.confirm(`Delete the request for ${request.employee}? This cannot be undone.`)) deleteRequest(request.id);
+                          }}>Delete</button>
+                        </>
+                      ) : null}
                     </div>
 
                     <div className="request-footer">
@@ -485,23 +596,43 @@ export default function App() {
         </main>
       ) : null}
 
+      {activeView === 'access-denied' ? (
+        <main className="panel access-denied">
+          <p className="eyebrow">403 · Access restricted</p>
+          <h2>You do not have permission to view this page.</h2>
+          <p>Your account can only access pages and data assigned to its role.</p>
+          <button type="button" className="primary-button" onClick={() => navigateTo('dashboard')}>Return to dashboard</button>
+        </main>
+      ) : null}
+
       {activeView === 'profile' ? (
         <section className="panel profile-panel">
           <div className="panel-header">
             <h2>Profile</h2>
-            <span>{session.role}</span>
+            <span>{roleLabel(session.role)}</span>
           </div>
 
           <div className="profile-grid">
             <div className="profile-box">
-              <h3>{session.fullName}</h3>
-              <p>{session.email}</p>
-              <p>Team: {session.team}</p>
+              <h3>Account details</h3>
+              <form className="access-form" onSubmit={updateProfile}>
+                <label>
+                  Full name
+                  <input value={profileForm.fullName} onChange={(event) => setProfileForm({ ...profileForm, fullName: event.target.value })} minLength={2} required />
+                </label>
+                <label>
+                  Email
+                  <input type="email" value={profileForm.email} onChange={(event) => setProfileForm({ ...profileForm, email: event.target.value })} required />
+                </label>
+                <button type="submit" className="primary-button">Save profile</button>
+              </form>
             </div>
             <div className="profile-box">
-              <p><strong>Role:</strong> {session.role}</p>
+              <p><strong>Role:</strong> {roleLabel(session.role)}</p>
+              <p><strong>Team:</strong> {session.team}</p>
               <p><strong>Created:</strong> {formatDate(session.createdAt)}</p>
               <p><strong>Status:</strong> {session.status}</p>
+              <p className="help-text">Role, team, and account status can only be changed by an administrator.</p>
             </div>
           </div>
         </section>
@@ -510,11 +641,52 @@ export default function App() {
       {activeView === 'users' && session.role === 'admin' ? (
         <section className="panel users-panel">
           <div className="panel-header">
-            <h2>Users</h2>
+            <h2>User management</h2>
             <span>{users.length} total</span>
           </div>
 
+          <form className="admin-provision-form" onSubmit={provisionUser}>
+            <h3>Provision an account</h3>
+            <div className="admin-provision-fields">
+              <label>
+                Full name
+                <input value={adminForm.fullName} onChange={(event) => setAdminForm({ ...adminForm, fullName: event.target.value })} minLength={2} required />
+              </label>
+              <label>
+                Email
+                <input type="email" value={adminForm.email} onChange={(event) => setAdminForm({ ...adminForm, email: event.target.value })} required />
+              </label>
+              <label>
+                Temporary password
+                <input
+                  type="password"
+                  value={adminForm.password}
+                  onChange={(event) => setAdminForm({ ...adminForm, password: event.target.value })}
+                  minLength={10}
+                  maxLength={128}
+                  pattern="(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9]).{10,128}"
+                  autoComplete="new-password"
+                  required
+                />
+              </label>
+              <label>
+                Team
+                <input value={adminForm.team} onChange={(event) => setAdminForm({ ...adminForm, team: event.target.value })} required />
+              </label>
+              <label>
+                Role
+                <select value={adminForm.role} onChange={(event) => setAdminForm({ ...adminForm, role: event.target.value })}>
+                  <option value="user">Member</option>
+                  <option value="manager">Manager</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </label>
+            </div>
+            <button type="submit" className="primary-button">Create account</button>
+          </form>
+
           <div className="user-table">
+            {users.length === 0 ? <div className="empty-state">No accounts are available yet.</div> : null}
             {users.map((user) => (
               <div key={user.id} className="user-row">
                 <div>
@@ -522,20 +694,52 @@ export default function App() {
                   <small>{user.email}</small>
                 </div>
                 <span>{user.team}</span>
-                <span className={`role-pill ${user.role}`}>{user.role}</span>
+                <span className={`role-pill ${user.role}`}>{roleLabel(user.role)} · {user.status}</span>
                 <button
                   type="button"
                   className="secondary-button small"
+                  disabled={user.id === session.id}
+                  title={user.id === session.id ? 'Administrators cannot change their own role here.' : 'Switch member and manager permissions.'}
                   onClick={async () => {
                     const nextRole = user.role === 'user' ? 'manager' : 'user';
-                    await fetchJson(`/api/users/${user.id}`, {
-                      method: 'PATCH',
-                      body: JSON.stringify({ role: nextRole }),
-                    });
-                    await loadProtectedData(session);
+                    setError('');
+                    setNotice('');
+                    try {
+                      await fetchJson(`/api/users/${user.id}`, {
+                        method: 'PATCH',
+                        body: JSON.stringify({ role: nextRole }),
+                      });
+                      setNotice(`${user.fullName} is now a ${roleLabel(nextRole)}.`);
+                      await loadProtectedData(session);
+                    } catch (err) {
+                      setError(err.message);
+                    }
                   }}
                 >
-                  Toggle role
+                  Change role
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button small"
+                  disabled={user.id === session.id}
+                  onClick={async () => {
+                    const nextStatus = user.status === 'active' ? 'suspended' : 'active';
+                    if (nextStatus === 'suspended' && !window.confirm(`Suspend ${user.fullName}'s account and end their active sessions?`)) return;
+                    setError('');
+                    setNotice('');
+                    try {
+                      await fetchJson(`/api/users/${user.id}`, {
+                        method: 'PATCH',
+                        body: JSON.stringify({ status: nextStatus }),
+                      });
+                      setNotice(`${user.fullName}'s account is ${nextStatus}.`);
+                      await loadProtectedData(session);
+                    } catch (err) {
+                      setError(err.message);
+                    }
+                  }}
+                >
+                  {user.status === 'active' ? 'Suspend' : 'Reactivate'}
                 </button>
               </div>
             ))}

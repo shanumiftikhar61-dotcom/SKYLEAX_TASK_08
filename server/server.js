@@ -1,5 +1,5 @@
-﻿import express from 'express';
-import cors from 'cors';
+import express from 'express';
+import dotenv from 'dotenv';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID, randomBytes, pbkdf2Sync, timingSafeEqual } from 'node:crypto';
@@ -9,6 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, '..');
+dotenv.config({ path: path.join(projectRoot, '.env') });
 const dbDirectory = path.join(projectRoot, 'server', 'data');
 const dbPath = process.env.ACCESSHUB_DB_PATH || path.join(dbDirectory, 'accesshub.db');
 const distPath = path.join(projectRoot, 'dist');
@@ -18,11 +19,22 @@ fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 const app = express();
 const port = Number(process.env.PORT || 3002);
 const isProduction = process.env.NODE_ENV === 'production';
-const cookieSecure = process.env.SESSION_COOKIE_SECURE !== 'false' && isProduction;
+const cookieSecure = isProduction || process.env.SESSION_COOKIE_SECURE === 'true';
 const cookieSameSite = process.env.SESSION_COOKIE_SAME_SITE || 'lax';
+if (!['lax', 'strict', 'none'].includes(cookieSameSite.toLowerCase())) {
+  throw new Error('SESSION_COOKIE_SAME_SITE must be lax, strict, or none.');
+}
+if (cookieSameSite.toLowerCase() === 'none' && !cookieSecure) {
+  throw new Error('SameSite=None cookies require SESSION_COOKIE_SECURE=true.');
+}
 const db = new DatabaseSync(dbPath);
 const SESSION_COOKIE = 'accesshub_session';
 const VALID_ROLES = ['admin', 'manager', 'user'];
+const ROLE_PERMISSIONS = {
+  admin: ['requests:read', 'requests:create', 'requests:review', 'requests:delete', 'users:manage', 'teams:read', 'profile:read', 'profile:update'],
+  manager: ['requests:read', 'requests:create', 'requests:review', 'requests:delete', 'teams:read', 'profile:read', 'profile:update'],
+  user: ['requests:read', 'requests:create', 'profile:read', 'profile:update'],
+};
 const VALID_STATUS = ['pending', 'approved', 'rejected', 'revoked'];
 const VALID_REQUEST_TYPES = new Set(['software', 'facility', 'data', 'system', 'other']);
 
@@ -30,13 +42,15 @@ function normalizeText(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function createHash(password, saltValue = randomBytes(16).toString('hex')) {
-  const hash = pbkdf2Sync(password, saltValue, 100000, 64, 'sha256').toString('hex');
-  return { salt: saltValue, hash };
+const PASSWORD_ITERATIONS = 600000;
+
+function createHash(password, saltValue = randomBytes(16).toString('hex'), iterations = PASSWORD_ITERATIONS) {
+  const hash = pbkdf2Sync(password, saltValue, iterations, 64, 'sha256').toString('hex');
+  return { salt: saltValue, hash, iterations };
 }
 
-function verifyPassword(password, saltValue, expectedHash) {
-  const attempt = pbkdf2Sync(password, saltValue, 100000, 64, 'sha256').toString('hex');
+function verifyPassword(password, saltValue, expectedHash, iterations = PASSWORD_ITERATIONS) {
+  const attempt = pbkdf2Sync(password, saltValue, iterations, 64, 'sha256').toString('hex');
   const actual = Buffer.from(attempt, 'hex');
   const expected = Buffer.from(expectedHash, 'hex');
   if (actual.length !== expected.length) {
@@ -85,7 +99,7 @@ function parseCookies(headerValue = '') {
     if (separatorIndex === -1) continue;
     const key = trimmed.slice(0, separatorIndex);
     const value = trimmed.slice(separatorIndex + 1);
-    cookies[key] = decodeURIComponent(value);
+    cookies[key] = value;
   }
   return cookies;
 }
@@ -125,6 +139,7 @@ function ensureTables() {
       email TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       password_salt TEXT NOT NULL,
+      password_iterations INTEGER NOT NULL DEFAULT 100000,
       full_name TEXT NOT NULL,
       role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'user')),
       team TEXT NOT NULL DEFAULT 'General',
@@ -144,6 +159,7 @@ function ensureTables() {
 
     CREATE TABLE IF NOT EXISTS access_requests (
       id TEXT PRIMARY KEY,
+      created_by TEXT,
       employee TEXT NOT NULL,
       team TEXT NOT NULL,
       role TEXT NOT NULL,
@@ -157,6 +173,20 @@ function ensureTables() {
       createdAt TEXT NOT NULL,
       updatedAt TEXT NOT NULL
     );
+
+  `);
+
+  const requestColumns = db.prepare('PRAGMA table_info(access_requests)').all();
+  if (!requestColumns.some((column) => column.name === 'created_by')) {
+    db.exec('ALTER TABLE access_requests ADD COLUMN created_by TEXT');
+  }
+  const userColumns = db.prepare('PRAGMA table_info(users)').all();
+  if (!userColumns.some((column) => column.name === 'password_iterations')) {
+    db.exec('ALTER TABLE users ADD COLUMN password_iterations INTEGER NOT NULL DEFAULT 100000');
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_requests_created_by ON access_requests(created_by);
+    CREATE INDEX IF NOT EXISTS idx_requests_team_status ON access_requests(team, status);
   `);
 }
 
@@ -177,17 +207,18 @@ function seedUsers() {
   }
 
   const insert = db.prepare(
-    'INSERT INTO users (id, email, password_hash, password_salt, full_name, role, team, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO users (id, email, password_hash, password_salt, password_iterations, full_name, role, team, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
   );
 
   for (const item of users) {
     const now = new Date().toISOString();
-    const { salt, hash } = createHash(item.password);
+    const { salt, hash, iterations } = createHash(item.password);
     insert.run(
       randomUUID(),
       item.email,
       hash,
       salt,
+      iterations,
       item.fullName,
       item.role,
       item.team,
@@ -209,10 +240,14 @@ function validateRequestPayload(payload) {
   const status = normalizeText(payload.status || 'pending');
 
   if (employee.length < 2) errors.push('Employee name is required (minimum 2 characters).');
+  if (employee.length > 100) errors.push('Employee name must not exceed 100 characters.');
   if (team.length < 2) errors.push('Team is required (minimum 2 characters).');
+  if (team.length > 80) errors.push('Team must not exceed 80 characters.');
   if (role.length < 2) errors.push('Role is required (minimum 2 characters).');
+  if (role.length > 100) errors.push('Role must not exceed 100 characters.');
   if (!VALID_REQUEST_TYPES.has(accessType)) errors.push('Access type must be software, facility, data, system, or other.');
   if (justification.length < 10) errors.push('Justification must be at least 10 characters long.');
+  if (justification.length > 2000) errors.push('Justification must not exceed 2000 characters.');
   if (!['low', 'medium', 'high'].includes(priority)) errors.push('Priority must be low, medium, or high.');
   if (!VALID_STATUS.includes(status)) errors.push('Status must be pending, approved, rejected, or revoked.');
 
@@ -226,20 +261,29 @@ function validateUserInput(payload, mode = 'register') {
   const fullName = normalizeText(payload.fullName || payload.full_name || payload.name);
   const team = normalizeText(payload.team || 'General');
 
+  if (email.length > 254) errors.push('Email address must not exceed 254 characters.');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     errors.push('A valid email address is required.');
   }
-  if (password.length < 8) {
-    errors.push('Password must be at least 8 characters long.');
+  if (password.length > 128) errors.push('Password must not exceed 128 characters.');
+  if (password.length < 10 || !/[a-z]/.test(password) || !/[A-Z]/.test(password) || !/[0-9]/.test(password)) {
+    errors.push('Password must be at least 10 characters and include uppercase, lowercase, and numeric characters.');
   }
   if (fullName.length < 2) {
     errors.push('Full name is required.');
+  } else if (fullName.length > 100) {
+    errors.push('Full name must not exceed 100 characters.');
   }
+  if (team.length > 80) errors.push('Team must not exceed 80 characters.');
   if (mode === 'register' && payload.role && normalizeText(payload.role) !== 'user') {
     errors.push('Only public registration for the User role is allowed.');
   }
 
   return { errors, email, password, fullName, team };
+}
+
+function hasPermission(user, permission) {
+  return Boolean(user && ROLE_PERMISSIONS[user.role]?.includes(permission));
 }
 
 function requireAuth(req, res, next) {
@@ -250,18 +294,27 @@ function requireAuth(req, res, next) {
 
   const session = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
   if (!session) {
+    clearSessionCookie(res);
     return res.status(401).json({ success: false, error: { message: 'Session expired or invalid.' } });
   }
 
   if (new Date(session.expires_at).getTime() <= Date.now()) {
     db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    clearSessionCookie(res);
     return res.status(401).json({ success: false, error: { message: 'Session expired.' } });
   }
 
   const user = getUserById(session.user_id);
   if (!user) {
     db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    clearSessionCookie(res);
     return res.status(401).json({ success: false, error: { message: 'User session not found.' } });
+  }
+
+  if (user.status !== 'active') {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    clearSessionCookie(res);
+    return res.status(401).json({ success: false, error: { message: 'This account is inactive.' } });
   }
 
   req.user = sanitizeUser(user);
@@ -269,20 +322,38 @@ function requireAuth(req, res, next) {
   next();
 }
 
-function requireRole(...allowedRoles) {
+function requirePermission(permission) {
   return (req, res, next) => {
-    if (!req.user || !allowedRoles.includes(req.user.role)) {
+    if (!hasPermission(req.user, permission)) {
       return res.status(403).json({ success: false, error: { message: 'Forbidden: insufficient permissions.' } });
     }
     next();
   };
 }
 
-app.use(cors({ origin: true, credentials: true }));
+function clearSessionCookie(res) {
+  res.clearCookie(SESSION_COOKIE, {
+    httpOnly: true,
+    sameSite: cookieSameSite,
+    secure: cookieSecure,
+    path: '/',
+  });
+}
+
+function cookieOptions() {
+  return {
+    httpOnly: true,
+    sameSite: cookieSameSite,
+    secure: cookieSecure,
+    path: '/',
+    maxAge: 1000 * 60 * 60 * 12,
+  };
+}
+
 app.use(express.json({ limit: '1mb' }));
 
 app.get('/api/health', (_req, res) => {
-  res.json({ success: true, data: { ok: true, database: dbPath } });
+  res.json({ success: true, data: { ok: true } });
 });
 
 app.post('/api/auth/register', (req, res) => {
@@ -307,15 +378,16 @@ app.post('/api/auth/register', (req, res) => {
 
   const now = new Date().toISOString();
   const userId = randomUUID();
-  const { salt, hash } = createHash(validation.password);
+  const { salt, hash, iterations } = createHash(validation.password);
 
   db.prepare(
-    'INSERT INTO users (id, email, password_hash, password_salt, full_name, role, team, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO users (id, email, password_hash, password_salt, password_iterations, full_name, role, team, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
   ).run(
     userId,
     validation.email,
     hash,
     salt,
+    iterations,
     validation.fullName,
     'user',
     validation.team,
@@ -326,12 +398,7 @@ app.post('/api/auth/register', (req, res) => {
 
   const user = getUserById(userId);
   const session = createSessionRecord(userId);
-  res.cookie(SESSION_COOKIE, session.token, {
-    httpOnly: true,
-    sameSite: cookieSameSite,
-    secure: cookieSecure,
-    maxAge: 1000 * 60 * 60 * 12,
-  });
+  res.cookie(SESSION_COOKIE, session.token, cookieOptions());
 
   res.status(201).json({
     success: true,
@@ -356,19 +423,23 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(401).json({ success: false, error: { message: 'Invalid email or password.' } });
   }
 
-  const valid = verifyPassword(password, user.password_salt, user.password_hash);
+  if (password.length > 128) {
+    return res.status(400).json({ success: false, error: { message: 'Password must not exceed 128 characters.' } });
+  }
+  if (user.status !== 'active') {
+    return res.status(401).json({ success: false, error: { message: 'Invalid email or password.' } });
+  }
+
+  const valid = verifyPassword(password, user.password_salt, user.password_hash, user.password_iterations);
   if (!valid) {
     return res.status(401).json({ success: false, error: { message: 'Invalid email or password.' } });
   }
 
+  const previousToken = getSessionToken(req);
+  if (previousToken) db.prepare('DELETE FROM sessions WHERE token = ?').run(previousToken);
   db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);
   const session = createSessionRecord(user.id);
-  res.cookie(SESSION_COOKIE, session.token, {
-    httpOnly: true,
-    sameSite: cookieSameSite,
-    secure: cookieSecure,
-    maxAge: 1000 * 60 * 60 * 12,
-  });
+  res.cookie(SESSION_COOKIE, session.token, cookieOptions());
 
   res.json({
     success: true,
@@ -382,7 +453,7 @@ app.post('/api/auth/login', (req, res) => {
 app.post('/api/auth/logout', requireAuth, (req, res) => {
   const token = req.sessionToken;
   db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
-  res.clearCookie(SESSION_COOKIE);
+  clearSessionCookie(res);
   res.json({ success: true, data: { message: 'Logged out successfully.' } });
 });
 
@@ -390,14 +461,14 @@ app.get('/api/auth/session', requireAuth, (req, res) => {
   res.json({ success: true, data: { user: req.user } });
 });
 
-app.get('/api/users', requireAuth, requireRole('admin'), (_req, res) => {
+app.get('/api/users', requireAuth, requirePermission('users:manage'), (_req, res) => {
   const rows = db.prepare('SELECT * FROM users ORDER BY created_at DESC').all();
   res.json({ success: true, data: rows.map(sanitizeUser) });
 });
 
-app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
+app.post('/api/users', requireAuth, requirePermission('users:manage'), (req, res) => {
   const payload = req.body || {};
-  const validation = validateUserInput(payload, 'register');
+  const validation = validateUserInput(payload, 'admin');
   if (validation.errors.length > 0) {
     return res.status(400).json({ success: false, error: { message: 'Validation failed', details: validation.errors } });
   }
@@ -406,21 +477,23 @@ app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
     return res.status(409).json({ success: false, error: { message: 'A user with that email already exists.' } });
   }
 
-  const role = ['admin', 'manager', 'user'].includes(normalizeText(payload.role || ''))
-    ? normalizeText(payload.role)
-    : 'user';
+  const role = normalizeText(payload.role || 'user');
+  if (!VALID_ROLES.includes(role)) {
+    return res.status(400).json({ success: false, error: { message: 'Role is invalid.' } });
+  }
 
   const now = new Date().toISOString();
   const userId = randomUUID();
-  const { salt, hash } = createHash(validation.password);
+  const { salt, hash, iterations } = createHash(validation.password);
 
-  const user = db.prepare(
-    'INSERT INTO users (id, email, password_hash, password_salt, full_name, role, team, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  db.prepare(
+    'INSERT INTO users (id, email, password_hash, password_salt, password_iterations, full_name, role, team, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
   ).run(
     userId,
     validation.email,
     hash,
     salt,
+    iterations,
     validation.fullName,
     role,
     validation.team,
@@ -433,7 +506,7 @@ app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
   res.status(201).json({ success: true, data: sanitizeUser(created) });
 });
 
-app.get('/api/users/:id', requireAuth, (req, res) => {
+app.get('/api/users/:id', requireAuth, requirePermission('profile:read'), (req, res) => {
   const targetId = req.params.id;
   const profileUser = getUserById(targetId);
   if (!profileUser) {
@@ -447,7 +520,7 @@ app.get('/api/users/:id', requireAuth, (req, res) => {
   res.json({ success: true, data: sanitizeUser(profileUser) });
 });
 
-app.patch('/api/users/:id', requireAuth, (req, res) => {
+app.patch('/api/users/:id', requireAuth, requirePermission('profile:update'), (req, res) => {
   const targetId = req.params.id;
   const targetUser = getUserById(targetId);
   if (!targetUser) {
@@ -468,10 +541,9 @@ app.patch('/api/users/:id', requireAuth, (req, res) => {
     return res.status(403).json({ success: false, error: { message: 'You cannot change your role.' } });
   }
 
-  const allowedFields = ['fullName', 'full_name', 'email', 'team', 'status'];
-  if (isAdmin && roleUpdate && VALID_ROLES.includes(roleUpdate)) {
-    allowedFields.push('role');
-  }
+  const allowedFields = isAdmin
+    ? ['fullName', 'full_name', 'email', 'team', 'status', 'role']
+    : ['fullName', 'full_name', 'email'];
 
   const updates = {};
   for (const field of allowedFields) {
@@ -480,8 +552,12 @@ app.patch('/api/users/:id', requireAuth, (req, res) => {
     }
   }
 
-  if (isSelf && payload.role !== undefined) {
-    return res.status(400).json({ success: false, error: { message: 'Role changes are not allowed for your own profile.' } });
+  if (!isAdmin && (payload.role !== undefined || payload.status !== undefined || payload.team !== undefined)) {
+    return res.status(403).json({ success: false, error: { message: 'Only administrators can change role, status, or team.' } });
+  }
+
+  if (isSelf && (payload.role !== undefined || payload.status !== undefined)) {
+    return res.status(400).json({ success: false, error: { message: 'You cannot change your own role or account status.' } });
   }
 
   if (!Object.keys(updates).length) {
@@ -493,15 +569,30 @@ app.patch('/api/users/:id', requireAuth, (req, res) => {
   const nextTeam = normalizeText(updates.team ?? targetUser.team);
   const nextStatus = normalizeText(updates.status ?? targetUser.status);
   const nextRole = isAdmin && updates.role !== undefined ? normalizeText(updates.role) : targetUser.role;
+  if (nextTeam.length < 2) {
+    return res.status(400).json({ success: false, error: { message: 'Team must be at least 2 characters.' } });
+  }
+  if (!['active', 'suspended'].includes(nextStatus)) {
+    return res.status(400).json({ success: false, error: { message: 'Status must be active or suspended.' } });
+  }
 
   if (nextFullName.length < 2) {
     return res.status(400).json({ success: false, error: { message: 'Full name must be at least 2 characters.' } });
+  }
+  if (nextFullName.length > 100 || nextEmail.length > 254 || nextTeam.length > 80) {
+    return res.status(400).json({ success: false, error: { message: 'Name, email, or team exceeds its maximum length.' } });
   }
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nextEmail)) {
     return res.status(400).json({ success: false, error: { message: 'A valid email address is required.' } });
   }
   if (!VALID_ROLES.includes(nextRole)) {
     return res.status(400).json({ success: false, error: { message: 'Role is invalid.' } });
+  }
+  if (targetUser.role === 'admin' && (nextRole !== 'admin' || nextStatus !== 'active')) {
+    const activeAdmins = db.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND status = 'active'").get().count;
+    if (activeAdmins <= 1) {
+      return res.status(409).json({ success: false, error: { message: 'The last active administrator cannot be demoted or suspended.' } });
+    }
   }
 
   const existingEmailUser = db.prepare('SELECT * FROM users WHERE email = ? AND id != ?').get(nextEmail, targetId);
@@ -512,12 +603,15 @@ app.patch('/api/users/:id', requireAuth, (req, res) => {
   db.prepare(
     'UPDATE users SET email = ?, full_name = ?, role = ?, team = ?, status = ?, updated_at = ? WHERE id = ?',
   ).run(nextEmail, nextFullName, nextRole, nextTeam, nextStatus, new Date().toISOString(), targetId);
+  if (nextStatus !== 'active') {
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(targetId);
+  }
 
   const updatedUser = getUserById(targetId);
   res.json({ success: true, data: sanitizeUser(updatedUser) });
 });
 
-app.get('/api/team/summary', requireAuth, requireRole('manager', 'admin'), (req, res) => {
+app.get('/api/team/summary', requireAuth, requirePermission('teams:read'), (req, res) => {
   const isAdmin = req.user.role === 'admin';
   const teamName = isAdmin ? null : req.user.team;
 
@@ -549,12 +643,19 @@ app.get('/api/team/summary', requireAuth, requireRole('manager', 'admin'), (req,
   res.json({ success: true, data: summary });
 });
 
-app.get('/api/requests', requireAuth, (req, res) => {
+app.get('/api/requests', requireAuth, requirePermission('requests:read'), (req, res) => {
   const { status, team } = req.query;
   let query = 'SELECT * FROM access_requests';
   const params = [];
+  if (req.user.role === 'user') {
+    query += ' WHERE created_by = ?';
+    params.push(req.user.id);
+  } else if (req.user.role === 'manager') {
+    query += ' WHERE team = ?';
+    params.push(req.user.team);
+  }
 
-  if (status || team) {
+  if ((status || team) && !query.includes(' WHERE ')) {
     const clauses = [];
     if (status) {
       clauses.push('status = ?');
@@ -565,6 +666,25 @@ app.get('/api/requests', requireAuth, (req, res) => {
       params.push(team);
     }
     query += ` WHERE ${clauses.join(' AND ')}`;
+  } else if (status || team) {
+    const clauses = [];
+    if (status) {
+      clauses.push('status = ?');
+      params.push(status);
+    }
+    if (team) {
+      if (req.user.role === 'manager' && team !== req.user.team) {
+        return res.status(403).json({ success: false, error: { message: 'Managers can only access their own team.' } });
+      }
+      if (req.user.role === 'user' && team !== req.user.team) {
+        return res.status(403).json({ success: false, error: { message: 'You can only access your own requests.' } });
+      }
+      if (req.user.role === 'admin') {
+        clauses.push('team = ?');
+        params.push(team);
+      }
+    }
+    if (clauses.length) query += ` AND ${clauses.join(' AND ')}`;
   }
 
   query += ' ORDER BY requestedAt DESC';
@@ -573,8 +693,12 @@ app.get('/api/requests', requireAuth, (req, res) => {
   res.json({ success: true, data: rows.map(serializeRequest) });
 });
 
-app.get('/api/stats', requireAuth, (_req, res) => {
-  const counts = db.prepare('SELECT status, COUNT(*) AS total FROM access_requests GROUP BY status').all();
+app.get('/api/stats', requireAuth, requirePermission('requests:read'), (req, res) => {
+  const scope = req.user.role === 'user' ? 'created_by = ?' : req.user.role === 'manager' ? 'team = ?' : '';
+  const scopeValue = req.user.role === 'user' ? req.user.id : req.user.team;
+  const counts = db.prepare(
+    `SELECT status, COUNT(*) AS total FROM access_requests ${scope ? `WHERE ${scope}` : ''} GROUP BY status`,
+  ).all(...(scope ? [scopeValue] : []));
   const stats = { total: 0, pending: 0, approved: 0, rejected: 0, revoked: 0 };
 
   for (const row of counts) {
@@ -585,9 +709,9 @@ app.get('/api/stats', requireAuth, (_req, res) => {
   res.json({ success: true, data: stats });
 });
 
-app.post('/api/requests', requireAuth, (req, res) => {
+app.post('/api/requests', requireAuth, requirePermission('requests:create'), (req, res) => {
   const payload = req.body || {};
-  const result = validateRequestPayload(payload);
+  const result = validateRequestPayload({ ...payload, status: 'pending' });
 
   if (result.errors.length > 0) {
     return res.status(400).json({ success: false, error: { message: 'Validation failed', details: result.errors } });
@@ -596,8 +720,9 @@ app.post('/api/requests', requireAuth, (req, res) => {
   const now = new Date().toISOString();
   const accessRequest = {
     id: randomUUID(),
+    created_by: req.user.id,
     employee: result.employee,
-    team: result.team,
+    team: req.user.role === 'admin' ? result.team : req.user.team,
     role: result.role,
     accessType: result.accessType,
     justification: result.justification,
@@ -613,8 +738,8 @@ app.post('/api/requests', requireAuth, (req, res) => {
   db.prepare(`
     INSERT INTO access_requests (
       id, employee, team, role, accessType, justification, priority, status,
-      reviewer, requestedAt, reviewedAt, createdAt, updatedAt
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      reviewer, requestedAt, reviewedAt, createdAt, updatedAt, created_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     accessRequest.id,
     accessRequest.employee,
@@ -629,29 +754,33 @@ app.post('/api/requests', requireAuth, (req, res) => {
     accessRequest.reviewedAt,
     accessRequest.createdAt,
     accessRequest.updatedAt,
+    accessRequest.created_by,
   );
 
   res.status(201).json({ success: true, data: serializeRequest(accessRequest) });
 });
 
-app.patch('/api/requests/:id', requireAuth, (req, res) => {
+app.patch('/api/requests/:id', requireAuth, requirePermission('requests:review'), (req, res) => {
   const { id } = req.params;
   const existingRecord = db.prepare('SELECT * FROM access_requests WHERE id = ?').get(id);
 
   if (!existingRecord) {
     return res.status(404).json({ success: false, error: { message: 'Access request not found.' } });
   }
+  if (req.user.role === 'manager' && existingRecord.team !== req.user.team) {
+    return res.status(403).json({ success: false, error: { message: 'Managers can only review requests for their own team.' } });
+  }
 
   const payload = req.body || {};
   const updates = {
-    employee: payload.employee !== undefined ? normalizeText(payload.employee) : existingRecord.employee,
-    team: payload.team !== undefined ? normalizeText(payload.team) : existingRecord.team,
-    role: payload.role !== undefined ? normalizeText(payload.role) : existingRecord.role,
-    accessType: payload.accessType !== undefined ? normalizeText(payload.accessType) : existingRecord.accessType,
-    justification: payload.justification !== undefined ? normalizeText(payload.justification) : existingRecord.justification,
-    priority: payload.priority !== undefined ? normalizeText(payload.priority) : existingRecord.priority,
+    employee: req.user.role === 'admin' && payload.employee !== undefined ? normalizeText(payload.employee) : existingRecord.employee,
+    team: req.user.role === 'admin' && payload.team !== undefined ? normalizeText(payload.team) : existingRecord.team,
+    role: req.user.role === 'admin' && payload.role !== undefined ? normalizeText(payload.role) : existingRecord.role,
+    accessType: req.user.role === 'admin' && payload.accessType !== undefined ? normalizeText(payload.accessType) : existingRecord.accessType,
+    justification: req.user.role === 'admin' && payload.justification !== undefined ? normalizeText(payload.justification) : existingRecord.justification,
+    priority: req.user.role === 'admin' && payload.priority !== undefined ? normalizeText(payload.priority) : existingRecord.priority,
     status: payload.status !== undefined ? normalizeText(payload.status) : existingRecord.status,
-    reviewer: payload.reviewer !== undefined ? normalizeText(payload.reviewer) : existingRecord.reviewer,
+    reviewer: req.user.role === 'admin' && payload.reviewer !== undefined ? normalizeText(payload.reviewer) : existingRecord.reviewer,
   };
 
   const validation = validateRequestPayload({
@@ -669,7 +798,7 @@ app.patch('/api/requests/:id', requireAuth, (req, res) => {
   }
 
   const now = new Date().toISOString();
-  const nextReviewer = updates.reviewer || req.user.fullName;
+  const nextReviewer = req.user.fullName;
 
   db.prepare(`
     UPDATE access_requests
@@ -693,12 +822,15 @@ app.patch('/api/requests/:id', requireAuth, (req, res) => {
   res.json({ success: true, data: serializeRequest(updated) });
 });
 
-app.delete('/api/requests/:id', requireAuth, (req, res) => {
+app.delete('/api/requests/:id', requireAuth, requirePermission('requests:delete'), (req, res) => {
   const { id } = req.params;
   const existing = db.prepare('SELECT * FROM access_requests WHERE id = ?').get(id);
 
   if (!existing) {
     return res.status(404).json({ success: false, error: { message: 'Access request not found.' } });
+  }
+  if (req.user.role === 'manager' && existing.team !== req.user.team) {
+    return res.status(403).json({ success: false, error: { message: 'Managers can only delete requests for their own team.' } });
   }
 
   db.prepare('DELETE FROM access_requests WHERE id = ?').run(id);
@@ -715,7 +847,9 @@ if (fs.existsSync(distPath)) {
 
 app.use((err, _req, res, _next) => {
   console.error(err);
-  res.status(500).json({ success: false, error: { message: 'Internal server error' } });
+  const status = [400, 413].includes(err.status) ? err.status : 500;
+  const message = status === 400 ? 'Invalid request body.' : status === 413 ? 'Request body is too large.' : 'Internal server error.';
+  res.status(status).json({ success: false, error: { message } });
 });
 
 ensureTables();
