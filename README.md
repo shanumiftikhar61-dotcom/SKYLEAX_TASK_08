@@ -1,6 +1,6 @@
 # AccessHub — Team Access Portal
 
-AccessHub is a responsive team access portal for submitting access requests, reviewing a team's queue, and managing accounts through server-enforced roles. It is built on the existing React and Express project and stores accounts, sessions, and access requests in SQLite.
+AccessHub is a responsive team access portal for submitting access requests, reviewing a team's queue, and managing accounts through server-enforced roles. The existing React and Express development backend remain available; the Cloudflare deployment backend is a Worker using D1 and Web Crypto.
 
 ## Features
 
@@ -16,9 +16,9 @@ AccessHub is a responsive team access portal for submitting access requests, rev
 
 - Node.js 22.12 or newer (`node:sqlite` and the patched Vite toolchain are required)
 - Express 4, React 18, and Vite 7
-- SQLite via Node's built-in `node:sqlite` module
-- PBKDF2-HMAC-SHA256 password hashing using Node's built-in crypto module
-- HttpOnly cookie sessions stored server-side in SQLite
+- SQLite via Node's built-in `node:sqlite` module for the local Express backend; Cloudflare D1 for Worker deployments
+- PBKDF2-HMAC-SHA256 password hashing using Node crypto locally and Web Crypto in the Worker
+- HttpOnly cookie sessions stored server-side
 - Supertest and Node's built-in test runner
 
 ## Prerequisites
@@ -101,7 +101,41 @@ npm.cmd test
 
 Tests use an isolated SQLite test database and cover registration validation/duplicates, password hashing and verification, login/logout, protected routes, all three roles, request ownership/team boundaries, profile access, privilege escalation, account suspension, and admin operations.
 
-## Production build and run
+## Cloudflare Worker deployment
+
+The Cloudflare Worker is configured in `wrangler.jsonc` as `skyleax-task-08`, with the existing D1 database bound as `DB` and Vite's built frontend exposed as `ASSETS`. `/api/*` is routed through the Worker; other paths are served from `dist`. The D1 migration creates missing tables without dropping data, and the Worker adds the legacy `password_iterations` and `created_by` columns when needed.
+
+Before deploying, create a strong, unique bootstrap secret and add it as a Worker secret. Do not commit the value or put it in `wrangler.jsonc`:
+
+```powershell
+cd "C:\Users\NJ\Documents\SKYLEAX_TASK_08"
+npm.cmd install
+npm.cmd run build
+npx.cmd wrangler secret put BOOTSTRAP_SECRET
+npm.cmd run db:migrate:remote
+```
+
+Set the `DB` D1 binding (database `accesshub-db`, ID `a50710b9-8b82-4f76-a71d-8d250e4c4af2`) and the `ASSETS` static-assets binding (directory `./dist`) in the Cloudflare dashboard if they are not populated from `wrangler.jsonc`. Configure `BOOTSTRAP_SECRET` as a Worker secret in **Settings → Variables and Secrets**. Keep the Wrangler configuration as the source of truth for bindings and use the same secret name there.
+
+After review, deploy with:
+
+```powershell
+npm.cmd run cf:deploy
+```
+
+Bootstrap the first administrator exactly once using the bootstrap secret; replace the URL with the deployed Worker URL and provide a new administrator email, name, and strong password. The response sets an authenticated session cookie:
+
+```powershell
+$headers = @{ "X-Bootstrap-Secret" = "<the configured BOOTSTRAP_SECRET>" }
+$body = @{ email = "admin@example.com"; fullName = "AccessHub Administrator"; password = "<unique strong password>"; team = "Operations" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "https://<worker-host>/api/auth/bootstrap-admin" -Headers $headers -ContentType "application/json" -Body $body -SessionVariable accessHubSession
+```
+
+The bootstrap endpoint refuses to create an administrator if one already exists and can only be used once. Remove/rotate `BOOTSTRAP_SECRET` after successful bootstrap. Public registration continues to create only Member (`user`) accounts.
+
+For local Worker development, run `npm.cmd run build`, then `npm.cmd run db:migrate:local` and `npm.cmd run cf:dev`. Local Wrangler may require a local `BOOTSTRAP_SECRET` in `.dev.vars` for bootstrap testing; never commit that file. `npm.cmd run db:migrate:remote` changes the configured remote D1 database, while `npm.cmd run cf:deploy` deploys the Worker. Neither has been run as part of this change.
+
+## Existing Express production build and run
 
 ```powershell
 cd "C:\Users\NJ\Documents\SKYLEAX_TASK_08"

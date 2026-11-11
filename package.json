@@ -12,7 +12,11 @@
     "client": "vite",
     "build": "vite build",
     "start": "node server/server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "cf:dev": "wrangler dev",
+    "cf:deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply accesshub-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply accesshub-db --remote"
   },
   "dependencies": {
     "dotenv": "^18.0.9",
@@ -24,6 +28,7 @@
     "@vitejs/plugin-react": "^5.2.0",
     "concurrently": "^9.2.5",
     "supertest": "^7.3.1",
-    "vite": "^7.3.7"
+    "vite": "^7.3.7",
+    "wrangler": "^4.160.0"
   }
 }
