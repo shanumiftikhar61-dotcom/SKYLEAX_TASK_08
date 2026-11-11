@@ -74,7 +74,7 @@ Privileged seed accounts are created only on an empty users table. Configure the
 ## Authentication and role permissions
 
 - Public registration always assigns the least-privileged `user` database role (shown as **Member** in the UI). A submitted privileged role is rejected.
-- Passwords require at least 10 characters with uppercase, lowercase, and numeric characters. They are stored as PBKDF2-HMAC-SHA256 hashes with a per-user random salt and 600,000 iterations. Existing hashes retain their stored iteration count.
+- Passwords require at least 10 characters with uppercase, lowercase, and numeric characters. The local Express backend uses PBKDF2-HMAC-SHA256 with a per-user random salt and 600,000 iterations; the Cloudflare Worker uses 100,000 iterations, supported by Cloudflare Web Crypto. Worker verification accepts hashes recorded at 100,000 iterations.
 - Login issues a random, 12-hour, HttpOnly, SameSite cookie. Cookies are Secure in production. The token is validated against a server-side SQLite session on protected API requests; logout deletes that server-side record.
 - Role permissions are defined centrally in `server/server.js` and enforced by Express middleware and resource checks—not by UI visibility alone.
 - Admins can view/manage users and access all teams' requests.

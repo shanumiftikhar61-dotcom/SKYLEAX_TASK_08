@@ -1,6 +1,6 @@
 const SESSION_COOKIE = 'accesshub_session';
 const SESSION_SECONDS = 60 * 60 * 12;
-const PASSWORD_ITERATIONS = 600000;
+const PASSWORD_ITERATIONS = 100000;
 const VALID_ROLES = ['admin', 'manager', 'user'];
 const VALID_STATUSES = ['pending', 'approved', 'rejected', 'revoked'];
 const VALID_REQUEST_TYPES = new Set(['software', 'facility', 'data', 'system', 'other']);
@@ -65,7 +65,7 @@ async function createPasswordHash(password, salt = crypto.getRandomValues(new Ui
 async function verifyPassword(password, saltValue, expectedHash, iterations) {
   const salt = hexToBytes(saltValue);
   const expected = hexToBytes(expectedHash);
-  if (!salt.length || expected.length !== 64 || !Number.isInteger(iterations) || iterations < 1 || iterations > 2000000) {
+  if (!salt.length || expected.length !== 64 || iterations !== PASSWORD_ITERATIONS) {
     return false;
   }
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
@@ -73,7 +73,7 @@ async function verifyPassword(password, saltValue, expectedHash, iterations) {
     name: 'PBKDF2',
     hash: 'SHA-256',
     salt,
-    iterations,
+    iterations: PASSWORD_ITERATIONS,
   }, key, expected.length * 8));
   let difference = 0;
   for (let index = 0; index < expected.length; index += 1) difference |= bits[index] ^ expected[index];
